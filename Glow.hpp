@@ -1,0 +1,435 @@
+#pragma once
+#include <thread>
+#include <chrono>
+#include <cstdlib>
+#include <iostream>
+#include <vector>
+#include "Player.hpp"
+#include "LocalPlayer.hpp"
+#include "Offsets.hpp"
+#include "Camera.hpp"
+#include "GlowMode.hpp"
+#include "DMALibrary/Memory/Memory.h"
+#include <array>
+
+struct Sense {
+    // Variables
+    Camera* GameCamera;
+    LocalPlayer* Myself;
+    std::vector<Player*>* Players;
+    int TotalSpectators = 0;
+    std::vector<std::string> Spectators;
+    uint64_t HighlightSettingsPointer;
+
+    bool ItemGlow = false;
+    bool PlayerGlow = true;  // Add player glow toggle
+    int MinimumItemRarity = 54;
+    
+    // Track players with active glow
+    std::vector<Player*> playersWithGlow;
+
+    // Define rarity constants
+    const int goldItems = 15;
+    const int redItems = 42;
+    const int purpleItems = 47;
+    const int blueItems = 54;
+    const int ammoBoxes = 58;
+    const int whiteItems = 65;
+
+    // Dynamic array for items to glow based on MinimumItemRarity
+    std::vector<int> itemsToGlow;
+
+    // Colors
+    float InvisibleGlowColor[3] = { 0, 1, 0 };
+    float VisibleGlowColor[3] = { 1, 0, 0 };
+    std::array<float, 3> highlightGlowColorRGB = { 0, 1, 0 };
+
+    Sense(std::vector<Player*>* Players, Camera* GameCamera, LocalPlayer* Myself) {
+        srand(static_cast<unsigned int>(time(nullptr))); // Seed RNG once per instance
+        this->Players = Players;
+        this->GameCamera = GameCamera;
+        this->Myself = Myself;
+        updateItemsToGlowArray(); // Initialize the items array
+    }
+
+    void Initialize() {
+        // idk, nothing for now
+    }
+
+    void updateItemsToGlowArray() {
+        itemsToGlow.clear();
+
+        switch (MinimumItemRarity) {
+        case 54:
+            itemsToGlow.push_back(54);
+            [[fallthrough]];
+        case 47:
+            itemsToGlow.push_back(47);
+            [[fallthrough]];
+        case 15:
+            itemsToGlow.push_back(15);
+            [[fallthrough]];
+        case 42:
+            itemsToGlow.push_back(42);
+            break;
+        default:
+            itemsToGlow.push_back(54);
+            itemsToGlow.push_back(47);
+            itemsToGlow.push_back(15);
+            itemsToGlow.push_back(42);
+            break;
+        }
+    }
+    
+    void setPlayerGlow(bool enabled) {
+        if (PlayerGlow != enabled) {
+            PlayerGlow = enabled;
+            if (!enabled) {
+                // Clear all glow when disabling
+                clearAllPlayerGlow();
+                // Force refresh all players to clear any lingering effects
+                forceRefreshAllPlayers();
+            }
+        }
+    }
+    
+    void clearAllPlayerGlow() {
+        for (auto& player : playersWithGlow) {
+            if (player && player->IsValid()) {
+                removePlayerGlow(player);
+            }
+        }
+        playersWithGlow.clear();
+    }
+    
+    void forceRefreshAllPlayers() {
+        // Force refresh all players to clear any lingering visual effects
+        if (Players && Players->size() > 0) {
+            for (int i = 0; i < Players->size(); i++) {
+                Player* Target = Players->at(i);
+                if (Target && Target->IsValid() && !Target->IsDummy() && !Target->IsLocal && Target->IsHostile) {
+                    removePlayerGlow(Target);
+                }
+            }
+        }
+    }
+
+    void setCustomGlow(Player* Target, int enable, int wall, bool isVisible) {
+        uint64_t basePointer = Target->BasePointer;
+        if (!mem.IsValidPointer(basePointer)) {
+            LOG("Invalid BasePointer 0x%llX for player, skipping glow\n", basePointer);
+            return;
+		}
+
+        std::array<unsigned char, 4> highlightFunctionBits = {
+            2,   // InsideFunction
+            125, // OutlineFunction: HIGHLIGHT_OUTLINE_OBJECTIVE
+            50,  // OutlineRadius: size * 255 / 8
+            64   // (EntityVisible << 6) | State & 0x3F | (AfterPostProcess << 7)
+        };
+
+        int settingIndex = isVisible ? 66 : 65; // Simple: visible=66, invisible=65
+        if (isVisible) {
+            highlightGlowColorRGB = { 0.0f, 1.0f, 0.0f }; // Green
+        }
+        else {
+            highlightGlowColorRGB = { 1.0f, 0.0f, 0.0f }; // Red
+        }
+
+
+        if (Target->GlowEnable != enable) {
+            uint64_t glowEnableAddress = basePointer + OFF_GLOW_ENABLE;
+            uint64_t PhysAddr;
+            if (mem.VirtToPhys(glowEnableAddress, PhysAddr)) {
+                mem.Write(PhysAddr, enable);
+            }
+        }
+
+        if (Target->GlowThroughWall != wall) {
+            uint64_t glowThroughWallAddress = basePointer + OFF_GLOW_THROUGH_WALL;
+            uint64_t PhysAddr;
+            if (mem.VirtToPhys(glowThroughWallAddress, PhysAddr)) {
+                mem.Write(PhysAddr, wall);
+            }
+        }
+
+        uint64_t highlightIdAddress = basePointer + OFF_GLOW_HIGHLIGHT_ID;
+        unsigned char value = settingIndex;
+        uint64_t PhysAddr;
+        if (mem.VirtToPhys(highlightIdAddress, PhysAddr)) {
+            mem.Write(PhysAddr, value);
+        }
+
+        uint64_t highlightSettingsPtr = HighlightSettingsPointer;
+        if (mem.IsValidPointer(highlightSettingsPtr)) {
+            auto handle = mem.CreateScatterHandle(-1);
+            uint64_t Pa1;
+            uint64_t Pa2;
+
+            if (mem.VirtToPhys(highlightSettingsPtr + OFF_GLOW_HIGHLIGHT_TYPE_SIZE * settingIndex + 0x0, Pa1)) {
+                mem.AddScatterWriteRequest(handle, Pa1, &highlightFunctionBits, sizeof(highlightFunctionBits));
+            }
+
+            if (mem.VirtToPhys(highlightSettingsPtr + OFF_GLOW_HIGHLIGHT_TYPE_SIZE * settingIndex + 0x4, Pa2)) {
+                mem.AddScatterWriteRequest(handle, Pa2, &highlightGlowColorRGB, sizeof(highlightGlowColorRGB));
+            }
+
+            mem.ExecuteWriteScatter(handle);
+            mem.CloseScatterHandle(handle);
+        }
+
+        uint64_t glowFixAddress = basePointer + OFF_GLOW_FIX;
+        if (mem.VirtToPhys(glowFixAddress, PhysAddr)) {
+            mem.Write(PhysAddr, 0);
+        }
+    }
+
+    void removePlayerGlow(Player* Target) {
+        uint64_t basePointer = Target->BasePointer;
+        if (!mem.IsValidPointer(basePointer)) {
+            return;
+        }
+
+        // Disable glow
+        uint64_t glowEnableAddress = basePointer + OFF_GLOW_ENABLE;
+        uint64_t PhysAddr;
+        if (mem.VirtToPhys(glowEnableAddress, PhysAddr)) {
+            mem.Write(PhysAddr, 0);
+        }
+
+        // Remove glow through wall
+        uint64_t glowThroughWallAddress = basePointer + OFF_GLOW_THROUGH_WALL;
+        if (mem.VirtToPhys(glowThroughWallAddress, PhysAddr)) {
+            mem.Write(PhysAddr, 0);
+        }
+
+        // Clear highlight ID
+        uint64_t highlightIdAddress = basePointer + OFF_GLOW_HIGHLIGHT_ID;
+        unsigned char value = 0;
+        if (mem.VirtToPhys(highlightIdAddress, PhysAddr)) {
+            mem.Write(PhysAddr, value);
+        }
+
+        // Clear glow fix
+        uint64_t glowFixAddress = basePointer + OFF_GLOW_FIX;
+        if (mem.VirtToPhys(glowFixAddress, PhysAddr)) {
+            mem.Write(PhysAddr, 0);
+        }
+        
+        // Clear glow distance
+        uint64_t glowDistanceAddress = basePointer + OFF_GLOW_DISTANCE;
+        if (mem.VirtToPhys(glowDistanceAddress, PhysAddr)) {
+            mem.Write(PhysAddr, 0);
+        }
+        
+        // Clear highlight settings that cause the orange outline
+        uint64_t highlightSettingsPtr = HighlightSettingsPointer;
+        if (mem.IsValidPointer(highlightSettingsPtr)) {
+            // Clear both visible (66) and invisible (65) highlight settings
+            for (int settingIndex : {65, 66}) {
+                uint64_t highlightAddress1 = highlightSettingsPtr + OFF_GLOW_HIGHLIGHT_TYPE_SIZE * settingIndex + 0x0;
+                uint64_t highlightAddress2 = highlightSettingsPtr + OFF_GLOW_HIGHLIGHT_TYPE_SIZE * settingIndex + 0x4;
+                
+                // Clear highlight function bits
+                std::array<unsigned char, 4> blankFunctionBits = {0, 0, 0, 0};
+                uint64_t PhysAddr1;
+                if (mem.VirtToPhys(highlightAddress1, PhysAddr1)) {
+                    mem.Write(PhysAddr1, blankFunctionBits);
+                }
+                
+                // Clear highlight color
+                std::array<float, 3> blankColor = {0.0f, 0.0f, 0.0f};
+                uint64_t PhysAddr2;
+                if (mem.VirtToPhys(highlightAddress2, PhysAddr2)) {
+                    mem.Write(PhysAddr2, blankColor);
+                }
+            }
+            
+            // Also try to clear any other potential highlight indices that might be active
+            // Some games use different highlight indices for different effects
+            for (int settingIndex : {0, 1, 2, 3, 4, 5, 10, 15, 20, 25, 30, 35, 40, 45, 50, 55, 60, 70, 75, 80, 85, 90, 95, 100}) {
+                uint64_t highlightAddress1 = highlightSettingsPtr + OFF_GLOW_HIGHLIGHT_TYPE_SIZE * settingIndex + 0x0;
+                uint64_t highlightAddress2 = highlightSettingsPtr + OFF_GLOW_HIGHLIGHT_TYPE_SIZE * settingIndex + 0x4;
+                
+                // Clear highlight function bits
+                std::array<unsigned char, 4> blankFunctionBits = {0, 0, 0, 0};
+                uint64_t PhysAddr1;
+                if (mem.VirtToPhys(highlightAddress1, PhysAddr1)) {
+                    mem.Write(PhysAddr1, blankFunctionBits);
+                }
+                
+                // Clear highlight color
+                std::array<float, 3> blankColor = {0.0f, 0.0f, 0.0f};
+                uint64_t PhysAddr2;
+                if (mem.VirtToPhys(highlightAddress2, PhysAddr2)) {
+                    mem.Write(PhysAddr2, blankColor);
+                }
+            }
+        }
+    }
+
+    void Update() {
+		int maxBatchSize = 1 + (rand() % 2);
+		int currentBatchCount = 0;
+
+        auto physhandle = mem.CreateScatterHandle(-1);
+
+        uint64_t highlightSettingsPtr = HighlightSettingsPointer;
+        if (mem.IsValidPointer(highlightSettingsPtr)) {
+            uint64_t highlightSize = OFF_GLOW_HIGHLIGHT_TYPE_SIZE;
+
+            const int allPossibleItems[] = { redItems, goldItems, purpleItems, blueItems };
+            const int allPossibleItemsCount = 4;
+
+            if (ItemGlow) {
+                GlowMode activeGlowMode = { 137, 138, 16, 127 };
+
+                for (int item : itemsToGlow) {
+                    const uintptr_t address = highlightSettingsPtr + (highlightSize * item);
+                    const GlowMode oldGlowMode = mem.Read<GlowMode>(address);
+                    if (activeGlowMode != oldGlowMode) {
+                        uint64_t PhysAddr;
+                        if (mem.VirtToPhys(address, PhysAddr)) {
+                            if (rand() % 3 != 0) {
+                                mem.Write(PhysAddr, activeGlowMode);
+                            }else{
+                                mem.AddScatterWriteRequest(physhandle, PhysAddr, &activeGlowMode, sizeof(activeGlowMode));
+								currentBatchCount++;
+                                if (currentBatchCount >= maxBatchSize) {
+                                    mem.ExecuteWriteScatter(physhandle);
+									mem.CloseScatterHandle(physhandle);
+									physhandle = mem.CreateScatterHandle(-1);
+									currentBatchCount = 0;
+									maxBatchSize = 1 + (rand() % 2);
+                                }
+                            }
+                            
+                        }
+                    }
+                }
+
+                GlowMode blankGlowMode = { 0, 0, 0, 0 };
+
+                for (int i = 0; i < allPossibleItemsCount; i++) {
+                    int item = allPossibleItems[i];
+
+                    bool shouldGlow = false;
+                    for (int glowItem : itemsToGlow) {
+                        if (item == glowItem) {
+                            shouldGlow = true;
+                            break;
+                        }
+                    }
+
+                    if (!shouldGlow) {
+                        const uintptr_t address = highlightSettingsPtr + (highlightSize * item);
+                        const GlowMode oldGlowMode = mem.Read<GlowMode>(address);
+                        if (blankGlowMode != oldGlowMode) {
+                            uint64_t PhysAddr;
+                            if (mem.VirtToPhys(address, PhysAddr)) {
+                                if (rand() % 3 != 0) {
+                                    mem.Write(PhysAddr, blankGlowMode);
+                                }
+                                else {
+                                    mem.AddScatterWriteRequest(physhandle, PhysAddr, &blankGlowMode, sizeof(blankGlowMode));
+                                    currentBatchCount++;
+
+                                    if (currentBatchCount >= maxBatchSize) {
+                                        mem.ExecuteWriteScatter(physhandle);
+                                        mem.CloseScatterHandle(physhandle);
+                                        physhandle = mem.CreateScatterHandle(-1);
+                                        currentBatchCount = 0;
+                                        maxBatchSize = 1 + (rand() % 2);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            else {
+                GlowMode BlankGlow = { 0, 0, 0, 0 };
+
+                for (int i = 0; i < allPossibleItemsCount; i++) {
+                    int item = allPossibleItems[i];
+                    const uintptr_t address = highlightSettingsPtr + (highlightSize * item);
+                    const GlowMode oldGlowMode = mem.Read<GlowMode>(address);
+                    if (BlankGlow != oldGlowMode) {
+                        uint64_t PhysAddr;
+                        if (mem.VirtToPhys(address, PhysAddr)) {
+                            if (rand() % 3 != 0) {
+                                mem.Write(PhysAddr, BlankGlow);
+                            }
+                            else {
+                                mem.AddScatterWriteRequest(physhandle, PhysAddr, &BlankGlow, sizeof(BlankGlow));
+                                currentBatchCount++;
+
+                                if (currentBatchCount >= maxBatchSize) {
+                                    mem.ExecuteWriteScatter(physhandle);
+                                    mem.CloseScatterHandle(physhandle);
+                                    physhandle = mem.CreateScatterHandle(-1);
+                                    currentBatchCount = 0;
+                                    maxBatchSize = 1 + (rand() % 2);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+
+        if (currentBatchCount > 0) {
+            mem.ExecuteWriteScatter(physhandle);
+        }
+        mem.CloseScatterHandle(physhandle);
+
+        for (int i = 0; i < Players->size(); i++) {
+            Player* Target = Players->at(i);
+            if (!Target->IsValid()) continue;
+            if (Target->IsDummy()) continue;
+            if (Target->IsLocal) continue;
+            if (!Target->IsHostile) continue;
+            
+            if (PlayerGlow) {
+                // Apply glow to player
+                setCustomGlow(Target, 1, 1, Target->IsVisible);
+                
+                // Track this player as having glow
+                bool alreadyTracked = false;
+                for (auto& player : playersWithGlow) {
+                    if (player == Target) {
+                        alreadyTracked = true;
+                        break;
+                    }
+                }
+                if (!alreadyTracked) {
+                    playersWithGlow.push_back(Target);
+                }
+            } else {
+                // Remove glow from player if they had it
+                bool hadGlow = false;
+                for (auto& player : playersWithGlow) {
+                    if (player == Target) {
+                        hadGlow = true;
+                        break;
+                    }
+                }
+                
+                if (hadGlow) {
+                    removePlayerGlow(Target);
+                }
+            }
+        }
+        
+        // If PlayerGlow is disabled, remove glow from all tracked players
+        if (!PlayerGlow) {
+            for (auto& player : playersWithGlow) {
+                if (player && player->IsValid()) {
+                    removePlayerGlow(player);
+                }
+            }
+            playersWithGlow.clear(); // Clear the tracking list
+        }
+    }
+};
